@@ -1,0 +1,928 @@
+openapi: 3.0.3
+info:
+  title: BOCA Ticket Server API
+  version: 2.2
+  description: |
+    API serwisu wydruków BOCA FGL. Niektóre odpowiedzi i zachowania zależą od modelu,
+    firmware i konfiguracji drukarki.
+
+    Jeśli server.apiKeyEnabled nie jest false, endpointy /api z wyjątkiem
+    /api/health wymagają nagłówka x-api-key. W przeciwnym razie klucz nie
+    jest wymagany. Brak lub błędny klucz zwraca HTTP 401; brak konfiguracji
+    klucza przy włączonej ochronie zwraca HTTP 503. Żądania JSON i YAML mają limit 2 MB; multipart ma limit
+    5 MB na plik. Wywołania drukowania i poleceń FGL mogą powodować fizyczne
+    wydruki lub zmiany w drukarce.
+servers:
+  - url: http://localhost:4100
+security:
+  - ApiKeyAuth: []
+tags:
+  - name: System
+  - name: Licencja
+  - name: Drukarki
+  - name: Szablony
+  - name: Wydruki
+  - name: Zadania
+  - name: Zasoby
+paths:
+  /api/health:
+    get:
+      tags: [System]
+      summary: Stan i wersja serwera
+      security: []
+      responses:
+        '200':
+          description: Serwer odpowiada.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: {type: boolean}
+                  version: {type: string}
+                  fgl: {type: string}
+                  apiKeyEnabled: {type: boolean}
+              example: {ok: true, version: 2.2.11, fgl: FGL46, apiKeyEnabled: false}
+  /api/license:
+    get:
+      tags: [Licencja]
+      summary: Ponownie sprawdź skonfigurowaną licencję
+      responses:
+        '200':
+          description: Licencja odczytana; expired może być true.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: {type: boolean}
+                  license: {$ref: '#/components/schemas/License'}
+              example:
+                ok: true
+                license:
+                  company: Example
+                  extras: [PosnetServer, PosnetServerValidTo, '3800000000', PosnetServerUniqueLicenseId, example-id]
+                  expired: false
+                  errorMessage: ''
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/license/renew:
+    post:
+      tags: [Licencja]
+      summary: Wymuś próbę odnowienia licencji
+      description: Pomija próg 10 dni, ale wymaga poprawnej licencji o tym samym identyfikatorze i dłuższej ważności. Przed podmianą tworzona jest kopia.
+      responses:
+        '200':
+          description: Odnowiono.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Object'}
+              example: {ok: true, renewed: true}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /api/fgl/commands:
+    get:
+      tags: [System]
+      summary: Katalog poleceń FGL
+      responses:
+        '200':
+          description: Katalog poleceń i informacje o dostępności.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Object'}
+              example: {ok: true, standard: FGL46, referenceRevision: '16.5', groups: {layout: ['RCx,y'], graphics: ['G#'], barcode: [BI], print: ['FF (0x0C)'], status: [S1], control: [DM], specialized: [T1]}, persistentCommands: [PF], destructiveCommands: [DM], notice: Availability depends on firmware and installed printer options.}
+  /api/events:
+    get:
+      tags: [System]
+      summary: Strumień zdarzeń statusu i zadań
+      description: Server-Sent Events; dane są wysyłane jako ramki data zawierające JSON typu status lub job.
+      responses:
+        '200':
+          description: Strumień zdarzeń.
+          content:
+            text/event-stream:
+              schema: {type: string}
+              example: "data: {\"type\":\"status\",\"data\":{\"id\":\"boca-main\",\"state\":\"ready\"}}\n\n"
+  /api/discovery/tcp:
+    post:
+      tags: [Drukarki]
+      summary: Sprawdź dostępność drukarek przez TCP
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [hosts]
+              properties:
+                hosts: {type: array, minItems: 1, maxItems: 64, items: {type: string}}
+                port: {type: integer, minimum: 1, maximum: 65535, default: 9100}
+                timeoutMs: {type: integer, description: Ograniczany do 100–3000 ms, default: 700}
+            example: {hosts: [192.0.2.10], port: 9100, timeoutMs: 700}
+      responses:
+        '200':
+          description: Wyniki połączeń; open nie potwierdza typu urządzenia.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Object'}
+              example: {ok: true, results: [{host: 192.0.2.10, port: 9100, open: true, protocol: tcp, identification: not-verified}]}
+        '400': {$ref: '#/components/responses/BadRequest'}
+  /api/discovery/scan:
+    get:
+      tags: [Drukarki]
+      summary: Wykryj lokalne drukarki USB, porty szeregowe lub urządzenia w sieci
+      description: |
+        USB klasy Printer jest wykrywane bez wysyłania poleceń: w Linuksie
+        przez sysfs, w Windows przez PnP, a w macOS przez IORegistry.
+        W Windows/macOS ścieżka ma wartość null i accessible wynosi false;
+        wykrywanie nie sprawdza uprawnień. Drukowanie USB wymaga odpowiedniej
+        konfiguracji i dostępu; Windows może wymagać sterownika WinUSB.
+        Wyniki portów szeregowych oznaczają tylko
+        możliwość otwarcia portu, bez potwierdzenia typu urządzenia.
+      parameters:
+        - in: query
+          name: source
+          schema: {type: string, enum: [usb, rs232, eth, all], default: all}
+          description: rs232 i all obejmują również wykrywanie USB.
+        - {in: query, name: timeout, schema: {type: integer, default: 300}}
+        - {in: query, name: connecttimeout, schema: {type: integer, default: 250}}
+        - {in: query, name: maxhosts, schema: {type: integer, default: 254}}
+        - {in: query, name: baudrates, schema: {type: string}, example: '9600,115200'}
+        - {in: query, name: ports, schema: {type: string}, example: '9100'}
+        - {in: query, name: legacy, schema: {type: string}, description: 'Sama obecność parametru włącza skanowanie portów legacy.'}
+      responses:
+        '200':
+          description: Wyniki i ostrzeżenia dotyczące skanowania.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Object'}
+              example:
+                ok: true
+                source: usb
+                usb: [{type: usb, path: /dev/usb/lp2, vendorId: 0a43, productId: '0201', manufacturer: Boca Systems Inc., product: FGL46 Thermal Printer, serialNumber: '123', accessible: false}]
+                network: []
+                scanned: {usbPrinters: 1, serialPorts: 0, serialPortsTotal: 0}
+                warnings: ['Brak dostępu do /dev/usb/lp2']
+                took: 10
+        '500': {$ref: '#/components/responses/InternalError'}
+  /api/printers:
+    get:
+      tags: [Drukarki]
+      summary: Lista drukarek
+      responses:
+        '200':
+          description: Skonfigurowane drukarki i ich status.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: {type: boolean}
+                  printers: {type: array, items: {$ref: '#/components/schemas/Printer'}}
+              example: {ok: true, printers: [{id: boca-main, name: BOCA, dpi: 200, status: {state: ready, flow: ready}}]}
+  /api/printers/{id}:
+    parameters: [{$ref: '#/components/parameters/PrinterId'}]
+    get:
+      tags: [Drukarki]
+      summary: Szczegóły drukarki i konfiguracja
+      responses:
+        '200':
+          description: Drukarka i jej konfiguracja.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: {type: boolean}
+                  printer: {$ref: '#/components/schemas/Printer'}
+                  config: {$ref: '#/components/schemas/Object'}
+              example: {ok: true, printer: {id: boca-main, status: {state: ready}}, config: {id: boca-main, dpi: 200}}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /api/printers/{id}/status:
+    parameters: [{$ref: '#/components/parameters/PrinterId'}]
+    get:
+      tags: [Drukarki]
+      summary: Bieżący zapamiętany status drukarki
+      responses:
+        '200':
+          description: Status.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: {type: boolean}
+                  status: {$ref: '#/components/schemas/PrinterStatus'}
+              example: {ok: true, status: {state: ready, flow: ready, lastError: null, ackCount: 0}}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /api/printers/{id}/connect:
+    parameters: [{$ref: '#/components/parameters/PrinterId'}]
+    post:
+      tags: [Drukarki]
+      summary: Połącz drukarkę
+      responses:
+        '200':
+          description: Połączono.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Object'}
+              example: {ok: true, status: {state: ready, flow: ready}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '502': {$ref: '#/components/responses/BadGateway'}
+  /api/printers/{id}/overview/refresh:
+    parameters: [{$ref: '#/components/parameters/PrinterId'}]
+    post:
+      tags: [Drukarki]
+      summary: Odśwież diagnostykę drukarki
+      description: Pyta drukarkę przez FGL i opcjonalnie jej stronę WWW. Częściowe błędy są zwracane w overview.errors.
+      responses:
+        '200':
+          description: Wynik diagnostyki.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Object'}
+              example: {ok: true, overview: {queriedAt: '2026-01-01T10:00:00Z', status: {ready: true}, fgl: {}, fields: {}, inventory: null, webpage: {available: false}, errors: [], sources: {}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '502': {$ref: '#/components/responses/BadGateway'}
+  /api/printers/{id}/status/query:
+    parameters: [{$ref: '#/components/parameters/PrinterId'}]
+    post:
+      tags: [Drukarki]
+      summary: Zapytaj drukarkę o status
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                command: {type: string, enum: [S1, S2, S7, S9, S92]}
+                timeoutMs: {type: integer, default: 8000}
+            example: {command: S1, timeoutMs: 8000}
+      responses:
+        '200':
+          description: Odpowiedź drukarki i zaktualizowany status.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Object'}
+              example: {ok: true, command: S1, result: {byte: 65}, status: {state: ready}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '504': {$ref: '#/components/responses/GatewayTimeout'}
+  /api/printers/{id}/command:
+    parameters: [{$ref: '#/components/parameters/PrinterId'}]
+    post:
+      tags: [Drukarki]
+      summary: Wyślij pojedyncze polecenie FGL
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [command]
+              properties: {command: {type: string}}
+            example: {command: S1}
+      responses:
+        '200':
+          description: Polecenie wysłane.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Object'}
+              example: {ok: true, sent: '<S1>'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /api/printers/{id}/raw:
+    parameters: [{$ref: '#/components/parameters/PrinterId'}]
+    post:
+      tags: [Drukarki]
+      summary: Wyślij surowe dane FGL
+      description: Dane mogą bezpośrednio sterować drukarką. Nie są objęte znakiem wodnym.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [dataBase64]
+              properties:
+                dataBase64: {type: string, format: byte, description: Maksymalnie 5 MB danych po dekodowaniu.}
+                awaitAck: {type: boolean, default: false}
+                timeoutMs: {type: integer, default: 20000}
+            example: {dataBase64: PFN4Pg==, awaitAck: false}
+      responses:
+        '200':
+          description: Wysłano i otrzymano wynik ACK.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Object'}
+              example: {ok: true, bytes: 4, ack: {ack: true}}
+        '202':
+          description: Wysłano bez oczekiwania na ACK.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Object'}
+              example: {ok: true, sent: true, bytes: 4, ackExpected: false}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /api/printers/{id}/protocol-log:
+    parameters: [{$ref: '#/components/parameters/PrinterId'}]
+    get:
+      tags: [Drukarki]
+      summary: Pobierz log komunikacji
+      parameters:
+        - in: query
+          name: limit
+          schema: {type: integer, minimum: 1, maximum: 20000, default: 5000}
+        - in: query
+          name: rotated
+          schema: {type: string, enum: ['true', 'false'], default: 'false'}
+      responses:
+        '200':
+          description: Log jako plik tekstowy.
+          content:
+            text/plain:
+              schema: {type: string}
+              example: '2026-01-01T10:00:00.000Z TX 3C 53 31 3E'
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+    delete:
+      tags: [Drukarki]
+      summary: Wyczyść log komunikacji
+      responses:
+        '200':
+          description: Log wyczyszczony.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Object'}
+              example: {ok: true, cleared: true}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /api/printers/{id}/assets/sync:
+    parameters: [{$ref: '#/components/parameters/PrinterId'}]
+    get:
+      tags: [Drukarki]
+      summary: Status synchronizacji zasobów
+      responses:
+        '200':
+          description: Stan synchronizacji.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Object'}
+              example: {ok: true, printerId: boca-main, sync: {status: pending, fonts: [], logos: [], error: null}}
+        '404': {$ref: '#/components/responses/NotFound'}
+    post:
+      tags: [Drukarki]
+      summary: Synchronizuj zasoby drukarki
+      responses:
+        '200':
+          description: Synchronizacja zakończona.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Object'}
+              example: {ok: true, printerId: boca-main, synchronization: {status: synced, fonts: [], logos: [], error: null}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '502':
+          description: Synchronizacja zakończyła się błędem.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Object'}
+              example: {ok: false, printerId: boca-main, synchronization: {status: failed}}
+  /api/printers/{id}/fonts/{name}/upload:
+    parameters:
+      - {$ref: '#/components/parameters/PrinterId'}
+      - {$ref: '#/components/parameters/FontName'}
+    post:
+      tags: [Drukarki, Zasoby]
+      summary: Wyślij font zapisany na serwerze do drukarki
+      description: Weryfikacja fontu TTF po wysłaniu używa inwentaryzacji INV2. awaitFlashAck wymaga odpowiedniej konfiguracji drukarki.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                id: {type: integer, minimum: 1, maximum: 32767}
+                mode: {type: string, enum: [temporary, permanent], default: temporary}
+                awaitFlashAck: {type: boolean, default: false}
+                timeoutMs: {type: integer, default: 30000}
+            example: {id: 1, mode: temporary, awaitFlashAck: false}
+      responses:
+        '200':
+          description: Dane wysłane; verified może być false mimo sukcesu transferu.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Object'}
+              example: {ok: true, sent: true, bytes: 12345, verified: true, registeredFont: {id: TTF1, bytes: 12330}, mode: printer-default}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /api/printers/{id}/logos/{name}/upload:
+    parameters:
+      - {$ref: '#/components/parameters/PrinterId'}
+      - {$ref: '#/components/parameters/LogoName'}
+    post:
+      tags: [Drukarki, Zasoby]
+      summary: Konwertuj i wyślij logo do drukarki
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                id: {type: integer, minimum: 1, maximum: 511, default: 1}
+                widthDots: {type: integer, minimum: 8, maximum: 1200, description: Domyślnie szerokość nośnika w punktach.}
+                heightDots: {type: integer, minimum: 1, maximum: 8192, default: 640}
+                method: {type: string, enum: [dither, threshold], default: dither}
+                threshold: {type: integer, minimum: 0, maximum: 255, default: 160}
+            example: {id: 1, widthDots: 384, heightDots: 200, method: threshold, threshold: 170}
+      responses:
+        '200':
+          description: Dane wysłane; verified informuje o potwierdzeniu w INV2.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Object'}
+              example: {ok: true, sent: true, verified: true, inventoryChanged: true, wasPresentBefore: false, id: 1, bytes: 5000, widthDots: 384, heightDots: 200, rowBytes: 48, method: threshold, bmpBytes: 9600, registeredLogo: {id: LD1, bytes: 9600}, verificationError: null, inventory: {}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+  /api/printers/{id}/test:
+    parameters: [{$ref: '#/components/parameters/PrinterId'}]
+    post:
+      tags: [Drukarki, Wydruki]
+      summary: Dodaj wydruk testowy do kolejki
+      responses:
+        '202':
+          description: Zadanie w kolejce.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Object'}
+              example: {ok: true, jobId: 7bf35a7b-8cab-4041-bb20-03c7bdad5111}
+        '400': {$ref: '#/components/responses/BadRequest'}
+  /api/templates:
+    get:
+      tags: [Szablony]
+      summary: Lista nazw szablonów
+      responses:
+        '200':
+          description: Nazwy bez rozszerzeń.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Object'}
+              example: {ok: true, templates: [sample-ticket, szablon-1]}
+    post:
+      tags: [Szablony]
+      summary: Utwórz szablon
+      description: Bez parametru name serwer generuje kolejną nazwę szablon-N. Istniejąca nazwa nie jest nadpisywana.
+      parameters:
+        - in: query
+          name: name
+          schema: {type: string, pattern: '^[a-zA-Z0-9_-]+$'}
+          example: koncert
+      requestBody: {$ref: '#/components/requestBodies/Template'}
+      responses:
+        '201':
+          description: Utworzono szablon.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: {type: boolean}
+                  name: {type: string}
+                  template: {$ref: '#/components/schemas/Template'}
+              example: {ok: true, name: koncert, template: {cut: true, elements: [{type: text, x: 20, y: 20, value: 'Bilet {{name}}'}]}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '409': {$ref: '#/components/responses/Conflict'}
+  /api/templates/{name}:
+    parameters: [{$ref: '#/components/parameters/TemplateName'}]
+    get:
+      tags: [Szablony]
+      summary: Odczytaj szablon
+      responses:
+        '200':
+          description: Definicja szablonu.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TemplateResponse'}
+              example: {ok: true, template: {cut: true, elements: [{type: text, x: 20, y: 20, value: 'Bilet {{name}}'}]}}
+        '404': {$ref: '#/components/responses/NotFound'}
+    put:
+      tags: [Szablony]
+      summary: Zapisz lub zastąp szablon
+      requestBody: {$ref: '#/components/requestBodies/Template'}
+      responses:
+        '200':
+          description: Zapisana definicja.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TemplateResponse'}
+              example: {ok: true, template: {cut: true, elements: [{type: text, x: 20, y: 20, value: 'Bilet {{name}}'}]}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+  /api/tickets/print:
+    post:
+      tags: [Wydruki]
+      summary: Dodaj wydruk do kolejki
+      description: |
+        template może być nazwą zapisanego szablonu, obiektem albo tekstem
+        zawierającym szablon JSON/YAML. Całe żądanie może być JSON lub YAML.
+        Jeśli nie podano printerId, używana jest pierwsza skonfigurowana drukarka.
+        Odpowiedź 202 oznacza przyjęcie do kolejki, nie potwierdzenie wydruku.
+      requestBody:
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PrintRequest'}
+            examples:
+              named:
+                summary: Nazwa szablonu
+                value: {printerId: boca-main, template: sample-ticket, data: {name: Anna, ticketId: T-123}, copies: 1}
+              inline:
+                summary: Szablon jako obiekt
+                value: {printerId: boca-main, template: {cut: true, elements: [{type: text, x: 20, y: 20, value: 'Bilet {{name}}'}]}, data: {name: Anna}, copies: 1}
+              yamlTemplate:
+                summary: Szablon YAML jako tekst w JSON
+                value: {printerId: boca-main, template: "cut: true\nelements:\n  - type: text\n    x: 20\n    y: 20\n    value: 'Bilet {{name}}'\n", data: {name: Anna}}
+          application/yaml: &yamlRequest
+            schema: {$ref: '#/components/schemas/PrintRequest'}
+            example:
+              printerId: boca-main
+              template:
+                cut: true
+                elements: [{type: text, x: 20, y: 20, value: 'Bilet {{name}}'}]
+              data: {name: Anna}
+              copies: 1
+          application/x-yaml: *yamlRequest
+          text/yaml: *yamlRequest
+          text/x-yaml: *yamlRequest
+      responses:
+        '202':
+          description: Zadania przyjęte do kolejki.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: {type: boolean}
+                  jobs:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: {type: string}
+                        status: {type: string}
+                        copies: {type: integer}
+              example: {ok: true, jobs: [{id: 7bf35a7b-8cab-4041-bb20-03c7bdad5111, status: queued, copies: 1}]}
+        '400': {$ref: '#/components/responses/BadRequest'}
+  /api/jobs:
+    get:
+      tags: [Zadania]
+      summary: Lista zadań drukowania
+      parameters:
+        - {in: query, name: status, schema: {type: string}, example: printed}
+        - {in: query, name: printerId, schema: {type: string}, example: boca-main}
+        - {in: query, name: q, schema: {type: string}, description: 'Szukanie w ID, drukarce, statusie i błędzie.'}
+        - {in: query, name: page, schema: {type: integer, minimum: 1, default: 1}}
+        - {in: query, name: pageSize, schema: {type: integer, minimum: 1, maximum: 500, default: 250}}
+      responses:
+        '200':
+          description: Strona wyników i podsumowanie całej kolejki.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: {type: boolean}
+                  jobs: {type: array, items: {$ref: '#/components/schemas/Job'}}
+                  page: {type: integer}
+                  pages: {type: integer}
+                  pageSize: {type: integer}
+                  total: {type: integer}
+                  totalAll: {type: integer}
+                  counts:
+                    type: object
+                    properties: {active: {type: integer}, printed: {type: integer}}
+                  facets:
+                    type: object
+                    properties:
+                      statuses: {type: array, items: {type: string}}
+                      printers: {type: array, items: {type: string}}
+              example: {ok: true, jobs: [{id: example-job, printerId: boca-main, status: printed, payload: {template: sample-ticket, data: {name: Anna}, copies: 1}, attempts: 1, bytes: 42, error: null}], page: 1, pages: 1, pageSize: 250, total: 1, totalAll: 1, counts: {active: 0, printed: 1}, facets: {statuses: [printed], printers: [boca-main]}}
+  /api/jobs/{id}:
+    parameters: [{$ref: '#/components/parameters/JobId'}]
+    get:
+      tags: [Zadania]
+      summary: Szczegóły zadania
+      responses:
+        '200':
+          description: Zadanie wraz z payload, statusem i ewentualnym błędem.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/JobResponse'}
+              example: {ok: true, job: {id: example-job, printerId: boca-main, status: queued, payload: {template: sample-ticket, data: {name: Anna}, copies: 1}, attempts: 0, bytes: null, error: null}}
+        '404': {$ref: '#/components/responses/NotFound'}
+    delete:
+      tags: [Zadania]
+      summary: Anuluj zadanie oczekujące w kolejce
+      responses:
+        '200':
+          description: Zadanie anulowane.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/JobResponse'}
+              example: {ok: true, job: {id: example-job, printerId: boca-main, status: cancelled}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+  /api/assets:
+    get:
+      tags: [Zasoby]
+      summary: Lista obrazów, logo i fontów
+      responses:
+        '200':
+          description: Nazwy zasobów.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Object'}
+              example: {ok: true, assets: [image.png], logos: [logo.png], fonts: [Arial.ttf]}
+  /api/assets/{name}:
+    parameters: [{$ref: '#/components/parameters/AssetBaseName'}]
+    post:
+      tags: [Zasoby]
+      summary: Wgraj obraz do biblioteki
+      description: 'Obraz jest konwertowany do PNG; name to nazwa bez rozszerzenia. Przykład: curl -X POST -H "x-api-key: $API_KEY" -F "file=@image.jpg" http://localhost:4100/api/assets/image'
+      requestBody: {$ref: '#/components/requestBodies/FileUpload'}
+      responses:
+        '200': {$ref: '#/components/responses/AssetSaved'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+  /api/assets/logos/{name}:
+    parameters: [{$ref: '#/components/parameters/AssetBaseName'}]
+    post:
+      tags: [Zasoby]
+      summary: Wgraj logo do biblioteki
+      description: Obraz jest konwertowany do PNG; name to nazwa bez rozszerzenia.
+      requestBody: {$ref: '#/components/requestBodies/FileUpload'}
+      responses:
+        '200': {$ref: '#/components/responses/AssetSaved'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+  /api/assets/fonts:
+    post:
+      tags: [Zasoby]
+      summary: Wgraj font do biblioteki
+      description: Nazwa musi mieć rozszerzenie .ttf, .sfp lub .sfl; bez name używana jest oryginalna nazwa pliku.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: {type: string, format: binary}
+                name: {type: string, example: Arial.ttf}
+      responses:
+        '200':
+          description: Zapisano font.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Object'}
+              example: {ok: true, font: {name: Arial.ttf, bytes: 12345}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+  /api/assets/{name}/file:
+    parameters: [{$ref: '#/components/parameters/ImageName'}]
+    get:
+      tags: [Zasoby]
+      summary: Pobierz obraz
+      responses:
+        '200': {$ref: '#/components/responses/ImageFile'}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /api/assets/logos/{name}/file:
+    parameters: [{$ref: '#/components/parameters/LogoName'}]
+    get:
+      tags: [Zasoby]
+      summary: Pobierz logo
+      responses:
+        '200': {$ref: '#/components/responses/ImageFile'}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /api/assets/fonts/{name}/file:
+    parameters: [{$ref: '#/components/parameters/FontName'}]
+    get:
+      tags: [Zasoby]
+      summary: Pobierz plik TTF
+      responses:
+        '200':
+          description: Binarny plik fontu TTF.
+          content:
+            font/ttf:
+              schema: {type: string, format: binary}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /api/assets/{name}/fgl:
+    parameters: [{$ref: '#/components/parameters/ImageName'}]
+    get:
+      tags: [Zasoby]
+      summary: Konwertuj obraz do danych graficznych FGL
+      parameters:
+        - {in: query, name: x, schema: {type: integer, default: 0}}
+        - {in: query, name: y, schema: {type: integer, default: 0}}
+        - {in: query, name: widthDots, schema: {type: integer, minimum: 8, maximum: 1200, default: 160}}
+        - {in: query, name: threshold, schema: {type: number, minimum: 0, maximum: 255, default: 160}}
+      responses:
+        '200':
+          description: Dane FGL zakodowane w Base64.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Object'}
+              example: {ok: true, graphic: {base64: PFJDMCwwPjxHMT7/, bytes: 12, widthDots: 1, heightDots: 1, format: FGL46-G-graphics}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: x-api-key
+      description: Wymagany, gdy server.apiKeyEnabled nie jest false.
+  parameters:
+    PrinterId: {in: path, name: id, required: true, schema: {type: string}, example: boca-main}
+    JobId: {in: path, name: id, required: true, schema: {type: string}, example: 7bf35a7b-8cab-4041-bb20-03c7bdad5111}
+    TemplateName: {in: path, name: name, required: true, schema: {type: string}, example: sample-ticket}
+    AssetBaseName: {in: path, name: name, required: true, schema: {type: string}, example: logo}
+    ImageName: {in: path, name: name, required: true, schema: {type: string}, example: image.png}
+    LogoName: {in: path, name: name, required: true, schema: {type: string}, example: logo.png}
+    FontName: {in: path, name: name, required: true, schema: {type: string}, example: Arial.ttf}
+  schemas:
+    Object:
+      type: object
+      additionalProperties: true
+    Error:
+      type: object
+      properties:
+        ok: {type: boolean, example: false}
+        error: {type: string, example: Printer not found}
+        code: {type: string, description: Opcjonalny kod błędu.}
+    License:
+      type: object
+      properties:
+        company: {type: string}
+        extras: {type: array, items: {type: string}}
+        errorMessage: {type: string}
+        expired: {type: boolean, description: 'Pole występuje, jeśli licencja zawiera PosnetServerValidTo.'}
+    PrinterStatus:
+      type: object
+      additionalProperties: true
+      properties:
+        state: {type: string, example: ready}
+        flow: {type: string, example: ready}
+        lastSeen: {type: integer, format: int64, nullable: true, description: Czas Unix w milisekundach.}
+        lastError: {type: string, nullable: true}
+        ackCount: {type: integer}
+        jamCount: {type: integer}
+        outOfStock: {type: boolean}
+    Printer:
+      type: object
+      additionalProperties: true
+      properties:
+        id: {type: string}
+        name: {type: string}
+        model: {type: string}
+        dpi: {type: integer}
+        media: {$ref: '#/components/schemas/Object'}
+        status: {$ref: '#/components/schemas/PrinterStatus'}
+    Job:
+      type: object
+      additionalProperties: true
+      properties:
+        id: {type: string}
+        printerId: {type: string}
+        status: {type: string, enum: [queued, printing, printed, failed, unknown, cancelled, interrupted]}
+        attempts: {type: integer}
+        createdAt: {type: integer, format: int64, description: Czas Unix w milisekundach.}
+        updatedAt: {type: integer, format: int64, description: Czas Unix w milisekundach.}
+        printedAt: {type: integer, format: int64, description: Czas Unix w milisekundach.}
+        payload:
+          type: object
+          additionalProperties: true
+          description: Parametry wejściowe wydruku lub informacja o wydruku testowym.
+        bytes: {type: integer, nullable: true}
+        ack: {type: boolean}
+        error:
+          nullable: true
+          description: Błąd zadania; starsze lub odzyskane zadania mogą zawierać tekst.
+          oneOf:
+            - type: string
+            - type: object
+              properties:
+                message: {type: string}
+                code: {type: string}
+                outcomeUnknown: {type: boolean}
+    JobResponse:
+      type: object
+      properties:
+        ok: {type: boolean}
+        job: {$ref: '#/components/schemas/Job'}
+    TemplateResponse:
+      type: object
+      properties:
+        ok: {type: boolean}
+        template: {$ref: '#/components/schemas/Template'}
+    Template:
+      type: object
+      required: [elements]
+      additionalProperties: true
+      properties:
+        cut: {type: boolean, default: true}
+        printCommand: {type: string, description: 'Polecenie kończące wydruk, np. FF lub GS.'}
+        allowRaw: {type: boolean, default: false}
+        elements:
+          type: array
+          items:
+            type: object
+            required: [type]
+            additionalProperties: true
+            properties:
+              type: {type: string, enum: [text, line, box, barcode, qr, pdf417, dataMatrix, aztec, command, graphics, logo, image, raw]}
+              x: {type: integer}
+              y: {type: integer}
+              value: {type: string}
+              when: {type: string}
+        sections: {type: array, items: {type: object, additionalProperties: true}}
+      example: {cut: true, elements: [{type: text, x: 20, y: 20, value: 'Bilet {{name}}'}]}
+    PrintRequest:
+      type: object
+      properties:
+        printerId: {type: string, example: boca-main}
+        template:
+          oneOf:
+            - type: string
+              description: Nazwa szablonu albo tekst JSON/YAML.
+            - $ref: '#/components/schemas/Template'
+          default: sample-ticket
+        data: {type: object, additionalProperties: true, example: {name: Anna, ticketId: T-123}}
+        copies: {type: integer, minimum: 1, maximum: 20, default: 1}
+  requestBodies:
+    Template:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Template'}
+          example: {cut: true, elements: [{type: text, x: 20, y: 20, value: 'Bilet {{name}}'}]}
+    FileUpload:
+      required: true
+      content:
+        multipart/form-data:
+          schema:
+            type: object
+            required: [file]
+            properties:
+              file: {type: string, format: binary}
+  responses:
+    BadRequest:
+      description: Nieprawidłowe żądanie lub błąd operacji.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+          example: {ok: false, error: Invalid request}
+    NotFound:
+      description: Zasób nie istnieje.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+          example: {ok: false, error: Printer not found}
+    Conflict:
+      description: Konflikt stanu lub operacja już trwa.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+          example: {ok: false, error: Operation already in progress}
+    Unavailable:
+      description: Usługa lub konfiguracja licencji jest niedostępna.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+          example: {ok: false, error: 'Nie można zweryfikować licencji. Szczegóły znajdują się w logu serwera.'}
+    BadGateway:
+      description: Błąd komunikacji z drukarką.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+          example: {ok: false, error: Printer connection failed}
+    GatewayTimeout:
+      description: Błąd lub przekroczenie czasu oczekiwania na status.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+          example: {ok: false, error: Status timeout, code: STATUS_ERROR}
+    InternalError:
+      description: Błąd wewnętrzny serwera.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+          example: {ok: false, error: Internal server error}
+    AssetSaved:
+      description: Zapisany plik PNG.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Object'}
+          example: {ok: true, asset: {name: logo.png, bytes: 1234}}
+    ImageFile:
+      description: Dane binarne obrazu.
+      content:
+        image/png: {schema: {type: string, format: binary}}
+        image/jpeg: {schema: {type: string, format: binary}}
+        image/webp: {schema: {type: string, format: binary}}
